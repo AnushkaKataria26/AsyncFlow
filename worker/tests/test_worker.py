@@ -50,13 +50,15 @@ def registry():
 
 @pytest.fixture
 def worker(config, registry):
-    return Worker(config, registry)
+    w = Worker(config, registry)
+    w.auth_token = "test-token"
+    return w
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")
 @patch("worker.worker.time.sleep")
 def test_worker_registers_on_startup(mock_sleep, mock_send, mock_db, worker):
-    mock_send.return_value = "EMPTY"
+    mock_send.return_value = "OK"
     
     # Run in a thread so we can stop it
     t = threading.Thread(target=worker.run)
@@ -68,6 +70,7 @@ def test_worker_registers_on_startup(mock_sleep, mock_send, mock_db, worker):
     t.join(timeout=1.0)
     
     mock_db.register_worker.assert_called_with("test_worker_1", worker.auth_token)
+    assert mock_send.call_args_list[0] == call(f"REGISTER test_worker_1 {worker.auth_token}", worker.config.queue_host, worker.config.queue_port)
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")
@@ -96,7 +99,7 @@ def test_valid_job_success_flow(mock_sleep, mock_send, mock_db, worker):
     
     # Verify order of calls
     # send_command -> db.get_job -> db.update_job_status(IN_PROGRESS) -> handler -> db.update_job_status(COMPLETED) -> send_command(ACK)
-    assert mock_send.call_args_list[0] == call(worker.config.queue_host, worker.config.queue_port, f"DEQUEUE {worker.config.lease_duration_seconds}")
+    assert mock_send.call_args_list[0] == call(f"DEQUEUE {worker.config.lease_duration_seconds} test-token", worker.config.queue_host, worker.config.queue_port)
     assert mock_db.get_job.call_args_list[0] == call("job-123")
     
     # IN_PROGRESS update
@@ -110,7 +113,7 @@ def test_valid_job_success_flow(mock_sleep, mock_send, mock_db, worker):
     assert comp_call.kwargs["result"] == "done"
     
     # ACK sent
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "ACK job-123")
+    assert mock_send.call_args_list[1] == call("ACK job-123 test-token", worker.config.queue_host, worker.config.queue_port)
     
     assert worker.consecutive_error_count == 0
 
@@ -136,7 +139,7 @@ def test_handler_exception(mock_sleep, mock_send, mock_db, worker):
     assert "exception on purpose" in fail_call.kwargs["result"]
     
     # REQUEUE sent
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "REQUEUE job-exc")
+    assert mock_send.call_args_list[1] == call("REQUEUE job-exc test-token", worker.config.queue_host, worker.config.queue_port)
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")
@@ -159,7 +162,7 @@ def test_handler_failure(mock_sleep, mock_send, mock_db, worker):
     assert fail_call.kwargs["result"] == "failed on purpose"
     
     # REQUEUE sent
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "REQUEUE job-fail")
+    assert mock_send.call_args_list[1] == call("REQUEUE job-fail test-token", worker.config.queue_host, worker.config.queue_port)
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")
@@ -170,7 +173,7 @@ def test_job_not_found(mock_sleep, mock_send, mock_db, worker):
     
     worker._poll_and_execute()
     
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "ACK job-missing")
+    assert mock_send.call_args_list[1] == call("ACK job-missing test-token", worker.config.queue_host, worker.config.queue_port)
     assert not mock_db.update_job_status.called
 
 @patch("worker.worker.db")
@@ -187,7 +190,7 @@ def test_job_already_completed(mock_sleep, mock_send, mock_db, worker):
     
     worker._poll_and_execute()
     
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "ACK job-done")
+    assert mock_send.call_args_list[1] == call("ACK job-done test-token", worker.config.queue_host, worker.config.queue_port)
     assert not mock_db.update_job_status.called
 
 @patch("worker.worker.db")
@@ -208,7 +211,7 @@ def test_unregistered_job_type(mock_sleep, mock_send, mock_db, worker):
     fail_call = mock_db.update_job_status.call_args_list[1]
     assert fail_call.args == ("job-unknown", "FAILED")
     assert "Unregistered job_type: unknown_job" in fail_call.kwargs["result"]
-    assert mock_send.call_args_list[1] == call(worker.config.queue_host, worker.config.queue_port, "ACK job-unknown")
+    assert mock_send.call_args_list[1] == call("ACK job-unknown test-token", worker.config.queue_host, worker.config.queue_port)
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")
@@ -231,7 +234,7 @@ def test_consecutive_error_count(mock_sleep, mock_send, mock_db, worker):
 @patch("worker.worker.send_command")
 @patch("worker.worker.time.sleep")
 def test_worker_stop_event(mock_sleep, mock_send, mock_db, worker):
-    mock_send.return_value = "EMPTY"
+    mock_send.return_value = "OK"
     
     t = threading.Thread(target=worker.run)
     t.start()
@@ -241,6 +244,26 @@ def test_worker_stop_event(mock_sleep, mock_send, mock_db, worker):
     worker.stop()
     t.join(timeout=2.0)
     assert not t.is_alive()
+    
+    # Check DEREGISTER was sent
+    deregister_call = call(f"DEREGISTER test_worker_1 {worker.auth_token}", worker.config.queue_host, worker.config.queue_port)
+    assert deregister_call in mock_send.call_args_list
+
+from shared.queue_client import QueueAuthError
+
+@patch("worker.worker.db")
+@patch("worker.worker.send_command")
+@patch("worker.worker.time.sleep")
+def test_queue_auth_error_triggers_reregistration(mock_sleep, mock_send, mock_db, worker):
+    mock_send.side_effect = [QueueAuthError("invalid token"), "OK"]
+    
+    worker._poll_and_execute()
+    
+    assert mock_send.call_count == 2
+    assert mock_send.call_args_list[0] == call(f"DEQUEUE {worker.config.lease_duration_seconds} test-token", worker.config.queue_host, worker.config.queue_port)
+    assert mock_send.call_args_list[1] == call(f"REGISTER test_worker_1 test-token", worker.config.queue_host, worker.config.queue_port)
+    assert worker.consecutive_error_count == 0
+
 
 @patch("worker.worker.db")
 @patch("worker.worker.send_command")

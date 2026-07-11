@@ -22,75 +22,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db import db
 
-@pytest.fixture(scope="session")
-def setup_infrastructure():
-    # Set environments
-    env = os.environ.copy()
-    env["DATABASE_URL"] = "sqlite:///asyncflow_test_int.db"
-    env["QUEUE_HOST"] = "127.0.0.1"
-    env["QUEUE_PORT"] = "9000"
-    
-    env["PYTHONPATH"] = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-    # Cleanup any old DB file
-    if os.path.exists("asyncflow_test_int.db"):
-        os.remove("asyncflow_test_int.db")
-
-    # Manually configure the DB URL for tests
-    db.DATABASE_URL = env["DATABASE_URL"]
-    # For sqlite we need NullPool inside db module logic, but we can just recreate the engine here
-    db.engine = db.create_engine(db.DATABASE_URL, poolclass=db.NullPool)
-    db.init_db()
-
-    processes = []
-    import sys
-
-    try:
-        # Start queue server
-        queue_proc = subprocess.Popen(["./queue_core/build/queue_server", "9000"], env=env)
-        processes.append(queue_proc)
-
-        # Wait for queue server
-        time.sleep(1) # simple wait
-
-        # Start Producer API
-        producer_proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "producer.main:app", "--port", "8000"], env=env)
-        processes.append(producer_proc)
-
-        # Wait for producer /health
-        for _ in range(50):
-            try:
-                res = requests.get("http://127.0.0.1:8000/health", timeout=1)
-                if res.status_code == 200:
-                    break
-            except:
-                pass
-            time.sleep(0.1)
-        else:
-            pytest.fail("Producer API failed to become healthy within 5 seconds")
-
-        # Start 3 workers
-        for i in range(3):
-            w_env = env.copy()
-            w_env["WORKER_ID"] = f"test_worker_{i}_{uuid.uuid4()}"
-            w_proc = subprocess.Popen([sys.executable, "-m", "worker"], env=w_env)
-            processes.append(w_proc)
-
-        yield
-    finally:
-        for p in processes:
-            p.terminate()
-        for p in processes:
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-
-        if os.path.exists("asyncflow_test_int.db"):
-            os.remove("asyncflow_test_int.db")
 
 @pytest.mark.integration
-def test_noop_jobs_complete(setup_infrastructure):
+def test_noop_jobs_complete(infrastructure):
     job_ids = []
     for _ in range(10):
         res = requests.post("http://127.0.0.1:8000/jobs", json={
@@ -124,7 +59,7 @@ def test_noop_jobs_complete(setup_infrastructure):
         pytest.fail(f"Some jobs failed to complete within timeout. Statuses: {results}")
 
 @pytest.mark.integration
-def test_jobs_distributed_across_workers(setup_infrastructure):
+def test_jobs_distributed_across_workers(infrastructure):
     job_ids = []
     for _ in range(9):
         res = requests.post("http://127.0.0.1:8000/jobs", json={
@@ -155,7 +90,7 @@ def test_jobs_distributed_across_workers(setup_infrastructure):
         assert len(worker_ids) >= 2, f"Jobs were not distributed, handled by: {worker_ids}"
 
 @pytest.mark.integration
-def test_idempotency_no_duplicate_execution(setup_infrastructure):
+def test_idempotency_no_duplicate_execution(infrastructure):
     ik = str(uuid.uuid4())
     res1 = requests.post("http://127.0.0.1:8000/jobs", json={
         "job_type": "noop",
@@ -181,7 +116,7 @@ def test_idempotency_no_duplicate_execution(setup_infrastructure):
         assert len(results) == 1
 
 @pytest.mark.integration
-def test_failed_job_requeued(setup_infrastructure):
+def test_failed_job_requeued(infrastructure):
     res = requests.post("http://127.0.0.1:8000/jobs", json={
         "job_type": "send_email",
         "payload": {"to": "test@fail.com", "subject": "a", "body": "b"},
@@ -213,7 +148,7 @@ def test_failed_job_requeued(setup_infrastructure):
         time.sleep(0.5)
 
 @pytest.mark.integration
-def test_worker_processes_jobs_concurrently(setup_infrastructure):
+def test_worker_processes_jobs_concurrently(infrastructure):
     job_ids = []
     
     def submit():
@@ -246,32 +181,11 @@ def test_worker_processes_jobs_concurrently(setup_infrastructure):
     assert duration < 15, f"Took {duration}s to complete 30 noop jobs, likely executing sequentially"
 
 @pytest.mark.integration
-def test_health_endpoint_reflects_queue_state(setup_infrastructure):
+def test_health_endpoint_reflects_queue_state(infrastructure):
     res = requests.get("http://127.0.0.1:8000/health")
     assert res.status_code == 200
     data = res.json()
     assert data["queue_reachable"] is True
     assert data["db_reachable"] is True
 
-@pytest.fixture(scope="session", autouse=True)
-def print_summary(setup_infrastructure):
-    yield
-    with db.engine.connect() as conn:
-        res = conn.execute(db.text("""
-            SELECT count(*),
-                   SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END),
-                   AVG((julianday(updated_at) - julianday(created_at)) * 86400.0) 
-            FROM jobs
-        """)).first()
-        
-        dl_res = conn.execute(db.text("SELECT count(*) FROM dead_letter_jobs")).first()
-        
-        total = (res[0] or 0) + (dl_res[0] or 0)
-        completed = res[1] or 0
-        avg_time = res[2] or 0.0
 
-        completion_rate = (completed / total * 100) if total > 0 else 0
-        print(f"\n--- Integration Test Summary ---")
-        print(f"Total jobs submitted: {total}")
-        print(f"Completion rate: {completion_rate:.2f}%")
-        print(f"Average time per job: {avg_time:.2f} seconds")

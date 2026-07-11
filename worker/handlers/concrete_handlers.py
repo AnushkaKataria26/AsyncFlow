@@ -85,6 +85,8 @@ class NoOpHandler(JobHandler):
 
     def execute(self, job_id: str, payload: dict) -> dict:
         try:
+            if "delay_seconds" in payload:
+                time.sleep(payload["delay_seconds"])
             return {"success": True, "result": "noop", "error": None}
         except Exception as e:
             return {"success": False, "result": None, "error": str(e)}

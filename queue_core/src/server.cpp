@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <unordered_map>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -42,6 +43,21 @@ std::string current_time_str() {
 // Log with timestamp
 void log_info(const std::string& msg) {
     std::cout << "[" << current_time_str() << "] " << msg << std::endl;
+}
+
+// Token registry for worker authentication
+// Note: Queue server restart loses all token state (in-memory registry).
+// Workers must re-register on reconnect. Persistence of tokens would require a DB-backed registry in production.
+std::unordered_map<std::string, std::string> token_to_worker_id;
+std::mutex token_mutex;
+
+// Token validation function
+// Tokens are opaque strings (UUIDs from Python side) - no cryptographic verification in C++, just registry lookup.
+// In production, tokens would be signed JWTs verified with a shared secret. For this project, registry lookup is sufficient.
+bool validate_token(const std::string& token) {
+    if (token.empty()) return false;
+    std::lock_guard<std::mutex> lock(token_mutex);
+    return token_to_worker_id.find(token) != token_to_worker_id.end();
 }
 
 // Validate if a job ID contains whitespace (we assume UUIDs or similar tokens without spaces)
@@ -106,13 +122,52 @@ void handle_client(int client_sock, std::shared_ptr<JobQueue> job_queue) {
             std::string response = "ERROR unknown command\n";
 
             try {
-                if (cmd == "ENQUEUE") {
-                    std::string job_id;
-                    std::getline(iss >> std::ws, job_id);
-                    if (job_id.empty()) {
-                        response = "ERROR missing job_id\n";
-                    } else if (has_whitespace(job_id)) {
-                        response = "ERROR empty or invalid job_id\n";
+                if (cmd == "REGISTER") {
+                    std::string worker_id, auth_token;
+                    iss >> worker_id >> auth_token;
+                    if (worker_id.empty() || auth_token.empty()) {
+                        response = "ERROR missing worker_id or auth_token\n";
+                    } else {
+                        std::lock_guard<std::mutex> lock(token_mutex);
+                        bool already_registered = false;
+                        for (const auto& pair : token_to_worker_id) {
+                            if (pair.second == worker_id) {
+                                if (pair.first == auth_token) {
+                                    response = "OK\n";
+                                } else {
+                                    response = "ERROR worker_id already registered\n";
+                                }
+                                already_registered = true;
+                                break;
+                            }
+                        }
+                        if (!already_registered) {
+                            token_to_worker_id[auth_token] = worker_id;
+                            response = "OK\n";
+                        }
+                    }
+                } else if (cmd == "DEREGISTER") {
+                    std::string worker_id, auth_token;
+                    iss >> worker_id >> auth_token;
+                    if (worker_id.empty() || auth_token.empty()) {
+                        response = "ERROR missing worker_id or auth_token\n";
+                    } else {
+                        std::lock_guard<std::mutex> lock(token_mutex);
+                        auto it = token_to_worker_id.find(auth_token);
+                        if (it != token_to_worker_id.end() && it->second == worker_id) {
+                            token_to_worker_id.erase(it);
+                            response = "OK\n";
+                        } else {
+                            response = "ERROR invalid token or worker_id mismatch\n";
+                        }
+                    }
+                } else if (cmd == "ENQUEUE") {
+                    std::string job_id, auth_token;
+                    iss >> job_id >> auth_token;
+                    if (job_id.empty() || auth_token.empty()) {
+                        response = "ERROR missing job_id or auth_token\n";
+                    } else if (!validate_token(auth_token)) {
+                        response = "AUTH_ERROR\n";
                     } else {
                         if (job_queue->contains(job_id)) {
                             response = "DUPLICATE\n";
@@ -122,12 +177,12 @@ void handle_client(int client_sock, std::shared_ptr<JobQueue> job_queue) {
                         }
                     }
                 } else if (cmd == "DEQUEUE") {
-                    std::string lease_str;
-                    std::getline(iss >> std::ws, lease_str);
-                    if (lease_str.empty()) {
-                        response = "ERROR missing lease duration\n";
-                    } else if (has_whitespace(lease_str)) {
-                        response = "ERROR invalid lease duration format\n";
+                    std::string lease_str, auth_token;
+                    iss >> lease_str >> auth_token;
+                    if (lease_str.empty() || auth_token.empty()) {
+                        response = "ERROR missing lease duration or auth_token\n";
+                    } else if (!validate_token(auth_token)) {
+                        response = "AUTH_ERROR\n";
                     } else {
                         try {
                             int lease = std::stoi(lease_str);
@@ -146,12 +201,12 @@ void handle_client(int client_sock, std::shared_ptr<JobQueue> job_queue) {
                         }
                     }
                 } else if (cmd == "ACK") {
-                    std::string job_id;
-                    std::getline(iss >> std::ws, job_id);
-                    if (job_id.empty()) {
-                        response = "ERROR missing job_id\n";
-                    } else if (has_whitespace(job_id)) {
-                        response = "ERROR empty or invalid job_id\n";
+                    std::string job_id, auth_token;
+                    iss >> job_id >> auth_token;
+                    if (job_id.empty() || auth_token.empty()) {
+                        response = "ERROR missing job_id or auth_token\n";
+                    } else if (!validate_token(auth_token)) {
+                        response = "AUTH_ERROR\n";
                     } else {
                         if (job_queue->acknowledge(job_id)) {
                             response = "OK\n";
@@ -160,12 +215,12 @@ void handle_client(int client_sock, std::shared_ptr<JobQueue> job_queue) {
                         }
                     }
                 } else if (cmd == "REQUEUE") {
-                    std::string job_id;
-                    std::getline(iss >> std::ws, job_id);
-                    if (job_id.empty()) {
-                        response = "ERROR missing job_id\n";
-                    } else if (has_whitespace(job_id)) {
-                        response = "ERROR empty or invalid job_id\n";
+                    std::string job_id, auth_token;
+                    iss >> job_id >> auth_token;
+                    if (job_id.empty() || auth_token.empty()) {
+                        response = "ERROR missing job_id or auth_token\n";
+                    } else if (!validate_token(auth_token)) {
+                        response = "AUTH_ERROR\n";
                     } else {
                         if (job_queue->requeue(job_id)) {
                             response = "OK\n";
@@ -173,6 +228,7 @@ void handle_client(int client_sock, std::shared_ptr<JobQueue> job_queue) {
                             response = "NOT_FOUND\n";
                         }
                     }
+
                 } else if (cmd == "STATUS") {
                     auto counts = job_queue->size();
                     response = "PENDING " + std::to_string(counts.first) + " LEASED " + std::to_string(counts.second) + "\n";

@@ -276,3 +276,39 @@ def mark_dead_workers(heartbeat_timeout_seconds: int) -> List[str]:
             """)
             res = conn.execute(stmt).fetchall()
             return [row[0] for row in res]
+
+def get_retryable_failed_jobs() -> List[Dict[str, Any]]:
+    """
+    Finds FAILED jobs where retry_count < max_retries.
+    Returns them ordered by updated_at ASC.
+    """
+    with engine.connect() as conn:
+        res = conn.execute(text("""
+            SELECT * FROM jobs
+            WHERE status = 'FAILED' AND retry_count < max_retries
+            ORDER BY updated_at ASC
+        """)).mappings().all()
+        return [dict(r) for r in res]
+
+def get_dlq_candidates() -> List[Dict[str, Any]]:
+    """
+    Returns FAILED jobs where retry_count >= max_retries, ordered by updated_at ASC.
+    """
+    with engine.connect() as conn:
+        res = conn.execute(text("""
+            SELECT * FROM jobs
+            WHERE status = 'FAILED' AND retry_count >= max_retries
+            ORDER BY updated_at ASC
+        """)).mappings().all()
+        return [dict(r) for r in res]
+
+def get_pending_jobs() -> List[Dict[str, Any]]:
+    """
+    Returns PENDING jobs where scheduled_time <= CURRENT_TIMESTAMP.
+    """
+    with engine.connect() as conn:
+        res = conn.execute(text("""
+            SELECT * FROM jobs
+            WHERE status = 'PENDING' AND scheduled_time <= CURRENT_TIMESTAMP
+        """)).mappings().all()
+        return [dict(r) for r in res]

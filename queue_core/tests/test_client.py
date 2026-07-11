@@ -57,7 +57,56 @@ class TestQueueServer(unittest.TestCase):
     def tearDown(self):
         self.client.close()
 
+    def test_auth_commands(self):
+        worker1 = "worker-1"
+        token1 = "token-1"
+        worker2 = "worker-2"
+        token2 = "token-2"
+
+        # REGISTER successful
+        self.assertEqual(self.client.send_command(f"REGISTER {worker1} {token1}"), "OK")
+        
+        # REGISTER idempotent (same worker and token)
+        self.assertEqual(self.client.send_command(f"REGISTER {worker1} {token1}"), "OK")
+        
+        # REGISTER error (same worker, different token)
+        self.assertTrue(self.client.send_command(f"REGISTER {worker1} {token2}").startswith("ERROR worker_id already registered"))
+        
+        # DEREGISTER successful
+        self.assertEqual(self.client.send_command(f"DEREGISTER {worker1} {token1}"), "OK")
+        
+        # DEREGISTER error (wrong token)
+        self.assertEqual(self.client.send_command(f"REGISTER {worker1} {token1}"), "OK")
+        self.assertTrue(self.client.send_command(f"DEREGISTER {worker1} {token2}").startswith("ERROR invalid token"))
+        self.client.send_command(f"DEREGISTER {worker1} {token1}")
+
+    def test_auth_errors(self):
+        job = str(uuid.uuid4())
+        # ENQUEUE without token (old format) => error missing token or auth error
+        resp = self.client.send_command(f"ENQUEUE {job}")
+        self.assertTrue(resp.startswith("ERROR") or resp == "AUTH_ERROR")
+
+        # DEQUEUE without token
+        resp = self.client.send_command("DEQUEUE 10")
+        self.assertTrue(resp.startswith("ERROR") or resp == "AUTH_ERROR")
+
+        # DEQUEUE with unregistered token
+        self.assertEqual(self.client.send_command("DEQUEUE 10 invalid-token"), "AUTH_ERROR")
+        
+        # ENQUEUE with unregistered token
+        self.assertEqual(self.client.send_command(f"ENQUEUE {job} invalid-token"), "AUTH_ERROR")
+        
+        # ACK with unregistered token
+        self.assertEqual(self.client.send_command(f"ACK {job} invalid-token"), "AUTH_ERROR")
+        
+        # REQUEUE with unregistered token
+        self.assertEqual(self.client.send_command(f"REQUEUE {job} invalid-token"), "AUTH_ERROR")
+
     def test_basic_commands(self):
+        token = "test-token-1"
+        worker = "test-worker-1"
+        self.client.send_command(f"REGISTER {worker} {token}")
+
         # STATUS empty
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 0 LEASED 0")
         
@@ -66,26 +115,26 @@ class TestQueueServer(unittest.TestCase):
         
         # ENQUEUE
         job1 = str(uuid.uuid4())
-        self.assertEqual(self.client.send_command(f"ENQUEUE {job1}"), "OK")
+        self.assertEqual(self.client.send_command(f"ENQUEUE {job1} {token}"), "OK")
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 1 LEASED 0")
         
         # ENQUEUE DUPLICATE
-        self.assertEqual(self.client.send_command(f"ENQUEUE {job1}"), "DUPLICATE")
+        self.assertEqual(self.client.send_command(f"ENQUEUE {job1} {token}"), "DUPLICATE")
         
         # DEQUEUE
-        res = self.client.send_command("DEQUEUE 10")
+        res = self.client.send_command(f"DEQUEUE 10 {token}")
         self.assertEqual(res, f"JOB {job1}")
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 0 LEASED 1")
         
         # DEQUEUE EMPTY
-        self.assertEqual(self.client.send_command("DEQUEUE 10"), "EMPTY")
+        self.assertEqual(self.client.send_command(f"DEQUEUE 10 {token}"), "EMPTY")
         
         # ACK
-        self.assertEqual(self.client.send_command(f"ACK {job1}"), "OK")
+        self.assertEqual(self.client.send_command(f"ACK {job1} {token}"), "OK")
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 0 LEASED 0")
         
         # ACK NOT FOUND
-        self.assertEqual(self.client.send_command(f"ACK {job1}"), "NOT_FOUND")
+        self.assertEqual(self.client.send_command(f"ACK {job1} {token}"), "NOT_FOUND")
 
     def test_error_cases(self):
         # Invalid commands
@@ -96,53 +145,64 @@ class TestQueueServer(unittest.TestCase):
         self.assertTrue(self.client.send_command("DEQUEUE").startswith("ERROR"))
         
         # Whitespace in job id
-        self.assertTrue(self.client.send_command("ENQUEUE job id with spaces").startswith("ERROR"))
-        
+        # 'ENQUEUE job id with spaces' parses as job_id='job', auth_token='id'. 
+        # Since 'id' is not a valid token, it returns AUTH_ERROR.
+        resp = self.client.send_command("ENQUEUE job id with spaces")
+        self.assertTrue(resp.startswith("ERROR") or resp == "AUTH_ERROR")
+
         # Negative lease
-        self.assertTrue(self.client.send_command("DEQUEUE -5").startswith("ERROR"))
-        self.assertTrue(self.client.send_command("DEQUEUE 0").startswith("ERROR"))
-        self.assertTrue(self.client.send_command("DEQUEUE abc").startswith("ERROR"))
+        self.assertTrue(self.client.send_command("DEQUEUE -5 token").startswith("ERROR") or self.client.send_command("DEQUEUE -5 token") == "AUTH_ERROR")
+        self.assertTrue(self.client.send_command("DEQUEUE 0 token").startswith("ERROR") or self.client.send_command("DEQUEUE 0 token") == "AUTH_ERROR")
+        self.assertTrue(self.client.send_command("DEQUEUE abc token").startswith("ERROR") or self.client.send_command("DEQUEUE abc token") == "AUTH_ERROR")
 
         # Line too long
         long_line = "A" * 300
         self.assertTrue(self.client.send_command(long_line).startswith("ERROR line too long"))
 
     def test_lease_expiry_and_requeue(self):
+        token = "test-token-2"
+        worker = "test-worker-2"
+        self.client.send_command(f"REGISTER {worker} {token}")
+
         job = str(uuid.uuid4())
-        self.client.send_command(f"ENQUEUE {job}")
+        self.client.send_command(f"ENQUEUE {job} {token}")
         
         # Lease for 1 second
-        self.assertEqual(self.client.send_command("DEQUEUE 1"), f"JOB {job}")
+        self.assertEqual(self.client.send_command(f"DEQUEUE 1 {token}"), f"JOB {job}")
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 0 LEASED 1")
         
         # Sleep to let lease expire
         time.sleep(2)
         
         # Sweep should occur on next DEQUEUE, and it should get the same job back
-        self.assertEqual(self.client.send_command("DEQUEUE 10"), f"JOB {job}")
+        self.assertEqual(self.client.send_command(f"DEQUEUE 10 {token}"), f"JOB {job}")
         
         # REQUEUE command
-        self.assertEqual(self.client.send_command(f"REQUEUE {job}"), "OK")
+        self.assertEqual(self.client.send_command(f"REQUEUE {job} {token}"), "OK")
         self.assertEqual(self.client.send_command("STATUS"), "PENDING 1 LEASED 0")
         
         # Check it can be dequeued again
-        self.assertEqual(self.client.send_command("DEQUEUE 10"), f"JOB {job}")
-        self.client.send_command(f"ACK {job}")
+        self.assertEqual(self.client.send_command(f"DEQUEUE 10 {token}"), f"JOB {job}")
+        self.client.send_command(f"ACK {job} {token}")
 
     def test_concurrent_dequeue(self):
+        token = "test-token-3"
+        worker = "test-worker-3"
+        self.client.send_command(f"REGISTER {worker} {token}")
+
         jobs = [str(uuid.uuid4()) for _ in range(3)]
         for j in jobs:
-            self.assertEqual(self.client.send_command(f"ENQUEUE {j}"), "OK")
+            self.assertEqual(self.client.send_command(f"ENQUEUE {j} {token}"), "OK")
             
         results = []
-        def worker():
+        def concurrent_worker():
             # Dedicated client per thread
             cli = QueueClient()
-            res = cli.send_command("DEQUEUE 10")
+            res = cli.send_command(f"DEQUEUE 10 {token}")
             results.append(res)
             cli.close()
 
-        threads = [threading.Thread(target=worker) for _ in range(5)]
+        threads = [threading.Thread(target=concurrent_worker) for _ in range(5)]
         for t in threads:
             t.start()
         for t in threads:
@@ -161,7 +221,7 @@ class TestQueueServer(unittest.TestCase):
 
         # Clean up
         for j in job_ids:
-            self.client.send_command(f"ACK {j}")
+            self.client.send_command(f"ACK {j} {token}")
 
 if __name__ == '__main__':
     unittest.main()

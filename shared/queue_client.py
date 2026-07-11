@@ -6,6 +6,15 @@ class QueueUnavailableError(Exception):
 class QueueTimeoutError(Exception):
     pass
 
+class QueueAuthError(Exception):
+    pass
+
+def build_authenticated_command(command_parts: list[str], auth_token: str) -> str:
+    """
+    Builds a command string with the auth token appended.
+    """
+    return " ".join(command_parts + [auth_token])
+
 def send_command(command: str, host: str, port: int, timeout_seconds: float = 5.0) -> str:
     """
     Connects to the C++ queue server, sends a command, and reads the response.
@@ -23,7 +32,10 @@ def send_command(command: str, host: str, port: int, timeout_seconds: float = 5.
                 if b"\n" in response:
                     break
                     
-            return response.decode('utf-8').strip()
+            resp_str = response.decode('utf-8').strip()
+            if resp_str == "AUTH_ERROR":
+                raise QueueAuthError("Auth token rejected by queue server")
+            return resp_str
     except socket.timeout:
         raise QueueTimeoutError(f"Connection to queue server at {host}:{port} timed out after {timeout_seconds}s")
     except ConnectionRefusedError:

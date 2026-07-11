@@ -19,6 +19,11 @@ from shared import queue_client
 QUEUE_HOST = os.environ.get("QUEUE_HOST", "localhost")
 QUEUE_PORT = int(os.environ.get("QUEUE_PORT", 9000))
 
+# Producer acts as a queue client, needs auth token
+PRODUCER_WORKER_ID = f"producer_{uuid.uuid4().hex}"
+PRODUCER_TOKEN = str(uuid.uuid4())
+is_registered = False
+
 app = FastAPI(title="AsyncFlow Producer API")
 logger = logging.getLogger(__name__)
 
@@ -75,8 +80,16 @@ def create_job(job_req: JobCreateRequest):
     queue_enqueue_failed = False
     # Enqueue to C++ server
     try:
+        global is_registered
+        if not is_registered:
+            try:
+                queue_client.send_command(f"REGISTER {PRODUCER_WORKER_ID} {PRODUCER_TOKEN}", QUEUE_HOST, QUEUE_PORT)
+                is_registered = True
+            except Exception as e:
+                logger.error(f"Failed to register producer with queue: {e}")
+                
         # We use the db generated job_id
-        response = queue_client.send_command(f"ENQUEUE {job_id}", QUEUE_HOST, QUEUE_PORT)
+        response = queue_client.send_command(f"ENQUEUE {job_id} {PRODUCER_TOKEN}", QUEUE_HOST, QUEUE_PORT)
         if response == "DUPLICATE":
             logger.warning(f"Queue returned DUPLICATE for newly created job {job_id}")
     except queue_client.QueueUnavailableError as e:
